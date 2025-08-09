@@ -1,0 +1,1114 @@
+<?php
+// Start output buffering to catch any unexpected output from includes
+ob_start();
+
+// Include configuration file
+require_once '../includes/config.php';
+// Include auth functions - avoid include_once which might have issues
+require '../includes/auth-new.php';
+
+// Capture any output from includes
+$unexpected_output = ob_get_clean();
+
+// If there's unexpected output (like BOM), log it but don't display it
+if (!empty($unexpected_output)) {
+    error_log("Unexpected output from includes: " . bin2hex($unexpected_output));
+}
+
+// Check if user is logged in
+if (!isset($_SESSION['user_id'])) {
+    header('Location: ' . BASE_URL . '/login.php');
+    exit();
+}
+
+// Check if team ID is provided
+if (!isset($_GET['id'])) {
+    header('Location: ' . BASE_URL . '/pages/teams.php');
+    exit();
+}
+
+$team_id = $_GET['id'];
+$user_id = $_SESSION['user_id'];
+
+// Make sure team_id is set and is a valid integer before using it in a query
+if (!isset($team_id) || empty($team_id) || !is_numeric($team_id)) {
+    $_SESSION['message'] = "Invalid team ID";
+    $_SESSION['message_type'] = "danger";
+    header("Location: " . BASE_URL . "/pages/teams.php");
+    exit();
+}
+
+$team_id = intval($team_id); // Ensure it's an integer
+
+// ULTRA RELIABLE: Direct SQL query to get all team members
+$direct_members = [];
+$direct_sql = "SELECT tm.user_id, tm.is_leader, u.first_name, u.last_name 
+               FROM team_members tm 
+               JOIN users u ON tm.user_id = u.user_id 
+               WHERE tm.team_id = $team_id 
+               ORDER BY tm.is_leader DESC, u.first_name ASC";
+$direct_result = mysqli_query($conn, $direct_sql);
+if ($direct_result) {
+    $direct_members_count = mysqli_num_rows($direct_result);
+    error_log("DIRECT SQL FOUND $direct_members_count MEMBERS FOR TEAM $team_id");
+    
+    while ($member = mysqli_fetch_assoc($direct_result)) {
+        $direct_members[] = [
+            'user_id' => $member['user_id'],
+            'first_name' => $member['first_name'],
+            'last_name' => $member['last_name'],
+            'is_leader' => $member['is_leader']
+        ];
+    }
+}
+
+// Get team details
+$sql = "SELECT t.*, CONCAT(u.first_name, ' ', u.last_name) as creator_name
+        FROM teams t
+        JOIN users u ON t.created_by = u.user_id
+        WHERE t.team_id = ?";
+
+if ($stmt = mysqli_prepare($conn, $sql)) {
+    mysqli_stmt_bind_param($stmt, "i", $team_id);
+    
+    if (mysqli_stmt_execute($stmt)) {
+        $result = mysqli_stmt_get_result($stmt);
+        
+        if (mysqli_num_rows($result) == 1) {
+            $team = mysqli_fetch_assoc($result);
+        } else {
+            // Set message
+            $_SESSION['message'] = "Team not found";
+            $_SESSION['message_type'] = "warning";
+            
+            // Redirect to teams page
+            header("Location: " . BASE_URL . "/pages/teams.php");
+            exit();
+        }
+    } else {
+        // Set message
+        $_SESSION['message'] = "Oops! Something went wrong. Please try again later.";
+        $_SESSION['message_type'] = "danger";
+        
+        // Redirect to teams page
+        header("Location: " . BASE_URL . "/pages/teams.php");
+        exit();
+    }
+    
+    mysqli_stmt_close($stmt);
+} else {
+    // Set message
+    $_SESSION['message'] = "Oops! Something went wrong. Please try again later.";
+    $_SESSION['message_type'] = "danger";
+    
+    // Redirect to teams page
+    header("Location: " . BASE_URL . "/pages/teams.php");
+    exit();
+}
+
+// Check if user is a member of this team
+$isMember = false;
+$isLeader = false;
+
+$sql = "SELECT is_leader FROM team_members WHERE team_id = ? AND user_id = ?";
+if ($stmt = mysqli_prepare($conn, $sql)) {
+    mysqli_stmt_bind_param($stmt, "ii", $team_id, $user_id);
+    
+    if (mysqli_stmt_execute($stmt)) {
+        mysqli_stmt_store_result($stmt);
+        
+        if (mysqli_stmt_num_rows($stmt) > 0) {
+            $isMember = true;
+            mysqli_stmt_bind_result($stmt, $leader_status);
+            mysqli_stmt_fetch($stmt);
+            $isLeader = $leader_status == 1;
+        }
+    }
+    
+    mysqli_stmt_close($stmt);
+}
+
+// Check if the user has already requested to join this team
+$hasRequestedToJoin = false;
+
+// Try to query the team_join_requests table, but catch exceptions if it doesn't exist
+try {
+    $sql = "SELECT request_id FROM team_join_requests WHERE team_id = ? AND user_id = ? AND status = 'pending'";
+    if ($stmt = mysqli_prepare($conn, $sql)) {
+        mysqli_stmt_bind_param($stmt, "ii", $team_id, $user_id);
+        
+        if (mysqli_stmt_execute($stmt)) {
+            mysqli_stmt_store_result($stmt);
+            
+            if (mysqli_stmt_num_rows($stmt) > 0) {
+                $hasRequestedToJoin = true;
+            }
+        }
+        
+        mysqli_stmt_close($stmt);
+    }
+} catch (Exception $e) {
+    // Table likely doesn't exist yet, just continue without it
+    $hasRequestedToJoin = false;
+}
+
+// Process join request if submitted
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['action']) && $_POST['action'] == 'join') {
+    // Check if user is already a member of another team
+    $sql = "SELECT team_id FROM team_members WHERE user_id = ?";
+    if ($stmt = mysqli_prepare($conn, $sql)) {
+        mysqli_stmt_bind_param($stmt, "i", $user_id);
+        
+        if (mysqli_stmt_execute($stmt)) {
+            mysqli_stmt_store_result($stmt);
+            
+            if (mysqli_stmt_num_rows($stmt) > 0) {
+                // Set message
+                $_SESSION['message'] = "You are already a member of another team";
+                $_SESSION['message_type'] = "warning";
+                
+                // Redirect back to team details
+                header("Location: " . BASE_URL . "/pages/team-details.php?id=" . $team_id);
+                exit();
+            }
+        }
+        
+        mysqli_stmt_close($stmt);
+    }
+    
+    // Try to submit join request
+    try {
+        // First, check if the table exists
+        $tableExists = false;
+        $checkTable = mysqli_query($conn, "SHOW TABLES LIKE 'team_join_requests'");
+        if (mysqli_num_rows($checkTable) > 0) {
+            $tableExists = true;
+        }
+        
+        if ($tableExists) {
+            // Submit join request if table exists
+            $sql = "INSERT INTO team_join_requests (team_id, user_id, request_message, status) VALUES (?, ?, ?, 'pending')";
+            if ($stmt = mysqli_prepare($conn, $sql)) {
+                mysqli_stmt_bind_param($stmt, "iis", $team_id, $user_id, $request_message);
+                
+                $request_message = isset($_POST['message']) ? trim($_POST['message']) : "I would like to join your team.";
+                
+                if (mysqli_stmt_execute($stmt)) {
+                    // Set success message
+                    $_SESSION['message'] = "Join request sent successfully!";
+                    $_SESSION['message_type'] = "success";
+                    
+                    // Redirect back to team details
+                    header("Location: " . BASE_URL . "/pages/team-details.php?id=" . $team_id);
+                    exit();
+                } else {
+                    // Set message
+                    $_SESSION['message'] = "Oops! Something went wrong. Please try again later.";
+                    $_SESSION['message_type'] = "danger";
+                }
+                
+                mysqli_stmt_close($stmt);
+            }
+        } else {
+            // If table doesn't exist, add user directly to the team (temporary workaround)
+            $sql = "INSERT INTO team_members (team_id, user_id, is_leader) VALUES (?, ?, 0)";
+            if ($stmt = mysqli_prepare($conn, $sql)) {
+                mysqli_stmt_bind_param($stmt, "ii", $team_id, $user_id);
+                
+                if (mysqli_stmt_execute($stmt)) {
+                    // Set success message
+                    $_SESSION['message'] = "You have joined the team successfully!";
+                    $_SESSION['message_type'] = "success";
+                    
+                    // Redirect back to team details
+                    header("Location: " . BASE_URL . "/pages/team-details.php?id=" . $team_id);
+                    exit();
+                } else {
+                    // Set message
+                    $_SESSION['message'] = "Oops! Something went wrong. Please try again later.";
+                    $_SESSION['message_type'] = "danger";
+                }
+                
+                mysqli_stmt_close($stmt);
+            }
+        }
+    } catch (Exception $e) {
+        // Set message
+        $_SESSION['message'] = "Oops! Something went wrong. Please try again later. Error: " . $e->getMessage();
+        $_SESSION['message_type'] = "danger";
+    }
+}
+
+// Process direct add user request (admin only) - DISABLED FOR ADMIN
+if (false && $_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['direct_add_submit']) && isAdmin()) {
+    $_SESSION['message'] = "This feature has been disabled for administrators";
+    $_SESSION['message_type'] = "warning";
+    
+    // Redirect to self to refresh the page
+    header("Location: " . BASE_URL . "/pages/team-details.php?id=" . $team_id);
+    exit();
+    
+    // Original code starts below (never executed)
+    $add_user_id = intval($_POST['direct_add_user_id']);
+}
+
+// Get team members
+$team_members = array();
+$sql = "SELECT u.user_id, u.first_name, u.last_name, u.username, u.profile_pic, u.skills, tm.is_leader 
+        FROM users u 
+        JOIN team_members tm ON u.user_id = tm.user_id 
+        WHERE tm.team_id = ?
+        ORDER BY tm.is_leader DESC, u.first_name, u.last_name";
+
+// Debug the raw team members data in the database
+$debug_sql = "SELECT * FROM team_members WHERE team_id = $team_id";
+$debug_result = mysqli_query($conn, $debug_sql);
+error_log("Raw team_members table data for team_id $team_id:");
+while ($row = mysqli_fetch_assoc($debug_result)) {
+    error_log("  user_id: {$row['user_id']}, is_leader: {$row['is_leader']}");
+}
+
+if ($stmt = mysqli_prepare($conn, $sql)) {
+    mysqli_stmt_bind_param($stmt, "i", $team_id);
+    
+    // Log the query being executed
+    error_log("Executing team members query for team_id: $team_id");
+    
+    if (mysqli_stmt_execute($stmt)) {
+        $result = mysqli_stmt_get_result($stmt);
+        $num_rows = mysqli_num_rows($result);
+        
+        // Log the number of results
+        error_log("Found $num_rows team members for team_id: $team_id");
+        
+        while ($row = mysqli_fetch_assoc($result)) {
+            $team_members[] = $row;
+            // Log each member
+            error_log("Team member: {$row['first_name']} {$row['last_name']} (user_id: {$row['user_id']}, is_leader: {$row['is_leader']})");
+        }
+    } else {
+        error_log("Error executing team members query: " . mysqli_error($conn));
+    }
+    
+    mysqli_stmt_close($stmt);
+} else {
+    error_log("Error preparing team members query: " . mysqli_error($conn));
+}
+
+// When we get to the team members section, ensure we have reliable data
+if (empty($team_members) && !empty($direct_members)) {
+    error_log("EMERGENCY: team_members array is empty but direct query found members. Using direct data.");
+    $team_members = $direct_members;
+}
+
+// Set flag to show debug information
+$is_debug_user = in_array($user_id, [6, 7]) || 
+                 (isset($_SESSION['role']) && $_SESSION['role'] === 'admin');
+
+// Get pending join requests (only for team leader)
+$join_requests = array();
+if ($isLeader) {
+    try {
+        // First, check if the table exists
+        $tableExists = false;
+        $checkTable = mysqli_query($conn, "SHOW TABLES LIKE 'team_join_requests'");
+        if (mysqli_num_rows($checkTable) > 0) {
+            $tableExists = true;
+        }
+        
+        if ($tableExists) {
+            $sql = "SELECT r.request_id, r.user_id, r.request_message, r.created_at, u.first_name, u.last_name, u.username 
+                    FROM team_join_requests r 
+                    JOIN users u ON r.user_id = u.user_id 
+                    WHERE r.team_id = ? AND r.status = 'pending'";
+                    
+            if ($stmt = mysqli_prepare($conn, $sql)) {
+                mysqli_stmt_bind_param($stmt, "i", $team_id);
+                
+                if (mysqli_stmt_execute($stmt)) {
+                    $result = mysqli_stmt_get_result($stmt);
+                    
+                    while ($row = mysqli_fetch_assoc($result)) {
+                        $join_requests[] = $row;
+                    }
+                }
+                
+                mysqli_stmt_close($stmt);
+            }
+        }
+    } catch (Exception $e) {
+        // If there's an error, just continue without join requests
+        $join_requests = array();
+    }
+}
+
+// Get team projects
+$projects = array();
+if ($isMember || isAdmin()) {
+    $sql = "SELECT project_id, title, description, status, submission_date 
+            FROM projects 
+            WHERE team_id = ?";
+            
+    if ($stmt = mysqli_prepare($conn, $sql)) {
+        mysqli_stmt_bind_param($stmt, "i", $team_id);
+        
+        if (mysqli_stmt_execute($stmt)) {
+            $result = mysqli_stmt_get_result($stmt);
+            
+            while ($row = mysqli_fetch_assoc($result)) {
+                $projects[] = $row;
+            }
+        }
+        
+        mysqli_stmt_close($stmt);
+    }
+}
+
+// Include header
+require_once '../includes/header.php';
+?>
+
+<?php if (isAdmin()): // Only show debug info to admin ?>
+<!-- Debug information -->
+<div class="container mt-4 mb-4">
+    <div class="card">
+        <div class="card-header bg-info text-white">
+            <h5 class="mb-0">Debug Information (Only visible to admin)</h5>
+        </div>
+        <div class="card-body">
+            <?php if (isset($_SESSION['member_add_error'])): ?>
+            <div class="alert alert-danger">
+                <h6>Error Adding Member:</h6>
+                <p><?php echo $_SESSION['member_add_error']; ?></p>
+                <?php unset($_SESSION['member_add_error']); ?>
+            </div>
+            <?php endif; ?>
+            
+            <?php if (isset($_SESSION['new_members_added']) && $_SESSION['new_members_added']): ?>
+            <div class="alert alert-success">
+                <p>New members were successfully added. If they don't appear in the list, please refresh the page.</p>
+                <?php if (isset($_SESSION['total_members_count'])): ?>
+                <p>Total members count from team creation: <?php echo $_SESSION['total_members_count']; ?></p>
+                <?php unset($_SESSION['total_members_count']); ?>
+                <?php endif; ?>
+                
+                <?php if (isset($_SESSION['members_details'])): ?>
+                <p>Members details:</p>
+                <ul>
+                    <li>Successfully added: <?php echo $_SESSION['members_details']['added']; ?> (including team leader)</li>
+                    <li>Already in other teams: <?php echo $_SESSION['members_details']['skipped']; ?></li>
+                    <li>Failed to add: <?php echo $_SESSION['members_details']['failed']; ?></li>
+                    <li>Not found in database: <?php echo $_SESSION['members_details']['not_found']; ?></li>
+                    <li>Total expected: <?php echo $_SESSION['members_details']['expected']; ?></li>
+                </ul>
+                <?php unset($_SESSION['members_details']); ?>
+                <?php endif; ?>
+                
+                <?php unset($_SESSION['new_members_added']); ?>
+            </div>
+            <?php endif; ?>
+            
+            <h6>Raw team_members Table Data:</h6>
+            <pre>
+<?php
+$raw_members_sql = "SELECT tm.*, u.first_name, u.last_name, u.email FROM team_members tm JOIN users u ON tm.user_id = u.user_id WHERE tm.team_id = $team_id";
+$raw_members_result = mysqli_query($conn, $raw_members_sql);
+echo "Found " . mysqli_num_rows($raw_members_result) . " row(s) in team_members table:\n";
+while ($row = mysqli_fetch_assoc($raw_members_result)) {
+    echo "User ID: {$row['user_id']} - {$row['first_name']} {$row['last_name']} ({$row['email']}) - is_leader: {$row['is_leader']}\n";
+    
+    // Store raw data for emergency use
+    $raw_db_members[] = [
+        'user_id' => $row['user_id'],
+        'first_name' => $row['first_name'],
+        'last_name' => $row['last_name'],
+        'is_leader' => $row['is_leader'],
+        'email' => $row['email']
+    ];
+}
+?>
+            </pre>
+            
+            <h6>Database Direct Check:</h6>
+            <pre>
+<?php
+// Direct MySQL query without any PHP transformations
+$direct_sql = "SELECT tm.user_id, tm.is_leader, u.first_name, u.last_name, u.username 
+               FROM team_members tm 
+               JOIN users u ON tm.user_id = u.user_id 
+               WHERE tm.team_id = $team_id
+               ORDER BY tm.is_leader DESC, u.first_name";
+$direct_result = mysqli_query($conn, $direct_sql);
+echo "Direct query found " . mysqli_num_rows($direct_result) . " member(s):\n";
+echo "-------------------------------\n";
+while ($row = mysqli_fetch_assoc($direct_result)) {
+    echo "User {$row['user_id']} - {$row['first_name']} {$row['last_name']} (@{$row['username']}) - Leader: " . ($row['is_leader'] ? "Yes" : "No") . "\n";
+    
+    // Store the raw result as a backup in case $team_members is empty or incorrect
+    $raw_team_members[] = $row;
+}
+
+// If we don't have team members data, use the raw data we just fetched
+if (empty($team_members) && !empty($raw_team_members)) {
+    $team_members = $raw_team_members;
+    echo "\n[Using raw data for team members display]";
+}
+?>
+            </pre>
+            
+            <h6>Team Members Array:</h6>
+            <pre><?php print_r($team_members); ?></pre>
+            
+            <h6 class="mt-3">Available Users:</h6>
+            <div class="table-responsive">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Name</th>
+                            <th>Email</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php
+                        $users_sql = "SELECT user_id, first_name, last_name, email FROM users";
+                        $users_result = mysqli_query($conn, $users_sql);
+                        while ($user = mysqli_fetch_assoc($users_result)) {
+                            echo "<tr>";
+                            echo "<td>{$user['user_id']}</td>";
+                            echo "<td>{$user['first_name']} {$user['last_name']}</td>";
+                            echo "<td>{$user['email']}</td>";
+                            echo "</tr>";
+                        }
+                        ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="alert alert-info mb-3">
+    <small>Debug: <?php echo count($team_members); ?> member(s) loaded | Expected: <?php echo mysqli_num_rows($raw_members_result); ?> member(s)</small>
+    <?php if (count($team_members) !== mysqli_num_rows($raw_members_result)): ?>
+    <br><small class="text-danger">Warning: Mismatch between loaded members and database records!</small>
+    <?php endif; ?>
+</div>
+
+<?php
+// Collect necessary data without displaying debug information
+$raw_members_sql = "SELECT tm.*, u.first_name, u.last_name, u.email FROM team_members tm JOIN users u ON tm.user_id = u.user_id WHERE tm.team_id = $team_id";
+$raw_members_result = mysqli_query($conn, $raw_members_sql);
+$raw_db_members = [];
+while ($row = mysqli_fetch_assoc($raw_members_result)) {
+    $raw_db_members[] = [
+        'user_id' => $row['user_id'],
+        'first_name' => $row['first_name'],
+        'last_name' => $row['last_name'],
+        'is_leader' => $row['is_leader'],
+        'email' => $row['email']
+    ];
+}
+
+// Direct MySQL query without any PHP transformations
+$direct_sql = "SELECT tm.user_id, tm.is_leader, u.first_name, u.last_name, u.username 
+               FROM team_members tm 
+               JOIN users u ON tm.user_id = u.user_id 
+               WHERE tm.team_id = $team_id
+               ORDER BY tm.is_leader DESC, u.first_name";
+$direct_result = mysqli_query($conn, $direct_sql);
+$raw_team_members = [];
+while ($row = mysqli_fetch_assoc($direct_result)) {
+    $raw_team_members[] = $row;
+}
+
+// If we don't have team members data, use the raw data we just fetched
+if (empty($team_members) && !empty($raw_team_members)) {
+    $team_members = $raw_team_members;
+}
+?>
+
+<!-- Available Users Section -->
+<div class="container mt-4 mb-4">
+    <div class="card">
+        <div class="card-header bg-info text-white">
+            <h5 class="mb-0">Available Users</h5>
+        </div>
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Name</th>
+                            <th>Email</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php
+                        $users_sql = "SELECT user_id, first_name, last_name, email FROM users";
+                        $users_result = mysqli_query($conn, $users_sql);
+                        while ($user = mysqli_fetch_assoc($users_result)) {
+                            echo "<tr>";
+                            echo "<td>{$user['user_id']}</td>";
+                            echo "<td>{$user['first_name']} {$user['last_name']}</td>";
+                            echo "<td>{$user['email']}</td>";
+                            echo "</tr>";
+                        }
+                        ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<div class="container">
+    <div class="row mb-4">
+        <div class="col-md-12">
+            <h1><?php echo $team['team_name']; ?></h1>
+            <nav aria-label="breadcrumb">
+                <ol class="breadcrumb">
+                    <li class="breadcrumb-item"><a href="<?php echo BASE_URL; ?>/pages/dashboard.php">Dashboard</a></li>
+                    <li class="breadcrumb-item"><a href="<?php echo BASE_URL; ?>/pages/teams.php">Teams</a></li>
+                    <li class="breadcrumb-item active" aria-current="page"><?php echo $team['team_name']; ?></li>
+                </ol>
+            </nav>
+        </div>
+    </div>
+    
+    <div class="row">
+        <div class="col-md-8">
+            <!-- Team Details -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">Team Details</h5>
+                </div>
+                <div class="card-body">
+                    <p class="lead"><?php echo $team['team_description']; ?></p>
+                    <div class="row mt-4">
+                        <div class="col-md-6">
+                            <p><strong>Created by:</strong> <?php echo isset($team['creator_name']) ? $team['creator_name'] : 'Unknown'; ?></p>
+                        </div>
+                        <div class="col-md-6">
+                            <p><strong>Created on:</strong> <?php echo date('M d, Y', strtotime($team['created_at'])); ?></p>
+                        </div>
+                    </div>
+                </div>
+                <?php if (!$isMember && !$hasRequestedToJoin && !isAdmin()): ?>
+                <div class="card-footer">
+                    <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#joinTeamModal">
+                        <i class="fas fa-user-plus me-2"></i> Request to Join
+                    </button>
+                </div>
+                <?php elseif ($hasRequestedToJoin): ?>
+                <div class="card-footer">
+                    <div class="alert alert-info mb-0">
+                        <i class="fas fa-info-circle me-2"></i> Your request to join this team is pending approval.
+                    </div>
+                </div>
+                <?php endif; ?>
+            </div>
+            
+            <!-- Team Members Detailed View -->
+            <div class="card mb-4">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">Team Members</h5>
+                    <a href="<?php echo BASE_URL; ?>/pages/team-details.php?id=<?php echo $team_id; ?>&refresh=<?php echo time(); ?>" class="btn btn-sm btn-outline-secondary">
+                        <i class="fas fa-sync-alt me-1"></i> Refresh
+                    </a>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="table table-hover">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Role</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="teamMembersTableBody">
+                                <?php foreach ($team_members as $member): ?>
+                                    <tr class="member-row" style="display: table-row !important; visibility: visible !important;">
+                                        <td style="display: table-cell !important; visibility: visible !important;">
+                                            <?php echo htmlspecialchars($member['first_name'] . ' ' . $member['last_name']); ?>
+                                        </td>
+                                        <td style="display: table-cell !important; visibility: visible !important;">
+                                            <?php if ($member['is_leader']): ?>
+                                                <span class="badge bg-primary">Leader</span>
+                                            <?php else: ?>
+                                                <span class="badge bg-secondary">Member</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td style="display: table-cell !important; visibility: visible !important;">
+                                            <?php if (
+                                                // Allow removal if:
+                                                // 1. Current user is team leader (but not trying to remove themselves)
+                                                ($isLeader && !$member['is_leader']) || 
+                                                // 2. Current user is admin
+                                                isAdmin() || 
+                                                // 3. User is trying to remove themselves (not as leader)
+                                                ($member['user_id'] == $user_id && !$member['is_leader'])
+                                            ): ?>
+                                                <form action="<?php echo BASE_URL; ?>/includes/remove_member.php" method="post" onsubmit="return confirm('Are you sure you want to remove this member from the team?');">
+                                                    <input type="hidden" name="member_id" value="<?php echo $member['user_id']; ?>">
+                                                    <input type="hidden" name="team_id" value="<?php echo $team_id; ?>">
+                                                    <button type="submit" class="btn btn-danger btn-sm">
+                                                        <i class="fas fa-user-minus"></i> Remove
+                                                    </button>
+                                                </form>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Team Projects -->
+            <?php if ($isMember || isAdmin()): ?>
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">Team Projects</h5>
+                </div>
+                <div class="card-body">
+                    <?php if (count($projects) > 0): ?>
+                    <div class="table-responsive">
+                        <table class="table table-hover">
+                            <thead>
+                                <tr>
+                                    <th>Project</th>
+                                    <th>Status</th>
+                                    <th>Submitted</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($projects as $project): ?>
+                                <tr>
+                                    <td><?php echo $project['title']; ?></td>
+                                    <td>
+                                        <?php
+                                        switch ($project['status']) {
+                                            case 'draft':
+                                                echo '<span class="badge bg-secondary">Draft</span>';
+                                                break;
+                                            case 'submitted':
+                                                echo '<span class="badge bg-warning">Under Review</span>';
+                                                break;
+                                            case 'rejected':
+                                                echo '<span class="badge bg-danger">Rejected</span>';
+                                                break;
+                                            case 'approved':
+                                                echo '<span class="badge bg-success">Approved</span>';
+                                                break;
+                                            default:
+                                                echo '<span class="badge bg-secondary">Unknown</span>';
+                                        }
+                                        ?>
+                                    </td>
+                                    <td>
+                                        <?php
+                                        echo $project['submission_date'] ? time_ago($project['submission_date']) : 'Not submitted';
+                                        ?>
+                                    </td>
+                                    <td>
+                                        <a href="<?php echo BASE_URL; ?>/pages/project-details.php?id=<?php echo $project['project_id']; ?>" class="btn btn-sm btn-primary">View</a>
+                                        <?php if (($isMember && ($project['status'] == 'draft' || $project['status'] == 'rejected')) || isAdmin()): ?>
+                                        <a href="<?php echo BASE_URL; ?>/pages/edit-project.php?id=<?php echo $project['project_id']; ?>" class="btn btn-sm btn-secondary">Edit</a>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                    <?php else: ?>
+                    <div class="alert alert-info">
+                        <i class="fas fa-info-circle me-2"></i> This team hasn't created any projects yet.
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <?php if ($isMember): ?>
+                <div class="card-footer text-end">
+                    <a href="<?php echo BASE_URL; ?>/pages/create-project.php" class="btn btn-primary">
+                        <i class="fas fa-plus me-2"></i> Create Project
+                    </a>
+                </div>
+                <?php endif; ?>
+            </div>
+            <?php endif; ?>
+        </div>
+        
+        <div class="col-md-4">
+            <!-- Members Summary Section -->
+            <div class="card mb-4">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">Members Summary (<?php echo count($team_members); ?>)</h5>
+                </div>
+                
+                <div class="card-body">
+                    <?php if (!empty($team_members)): ?>
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Role</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="teamMembersTableBody">
+                                    <?php foreach ($team_members as $member): ?>
+                                        <tr class="member-row" style="display: table-row !important; visibility: visible !important;">
+                                            <td style="display: table-cell !important; visibility: visible !important;">
+                                                <?php echo htmlspecialchars($member['first_name'] . ' ' . $member['last_name']); ?>
+                                            </td>
+                                            <td style="display: table-cell !important; visibility: visible !important;">
+                                                <?php if ($member['is_leader']): ?>
+                                                    <span class="badge bg-primary">Leader</span>
+                                                <?php else: ?>
+                                                    <span class="badge bg-secondary">Member</span>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    <?php else: ?>
+                        <div class="alert alert-info">No team members found</div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            
+            <!-- Join Requests (visible only to team leader) -->
+            <?php if ($isLeader && count($join_requests) > 0): ?>
+            <div class="card mb-4">
+                <div class="card-header">
+                    <h5 class="mb-0">Join Requests</h5>
+                </div>
+                <div class="card-body">
+                    <?php foreach ($join_requests as $request): ?>
+                    <div class="card mb-3">
+                        <div class="card-body">
+                            <h6><?php echo $request['first_name'] . ' ' . $request['last_name']; ?> (@<?php echo $request['username']; ?>)</h6>
+                            <p class="small text-muted">Requested: <?php echo date('M d, Y', strtotime($request['created_at'])); ?></p>
+                            <p><?php echo $request['request_message']; ?></p>
+                            <div class="d-flex">
+                                <form action="<?php echo BASE_URL; ?>/includes/process_request.php" method="post" class="me-2">
+                                    <input type="hidden" name="request_id" value="<?php echo $request['request_id']; ?>">
+                                    <input type="hidden" name="action" value="approve">
+                                    <button type="submit" class="btn btn-success btn-sm">Approve</button>
+                                </form>
+                                <form action="<?php echo BASE_URL; ?>/includes/process_request.php" method="post">
+                                    <input type="hidden" name="request_id" value="<?php echo $request['request_id']; ?>">
+                                    <input type="hidden" name="action" value="reject">
+                                    <button type="submit" class="btn btn-danger btn-sm">Reject</button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<!-- Join Team Modal -->
+<div class="modal fade" id="joinTeamModal" tabindex="-1" aria-labelledby="joinTeamModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="joinTeamModalLabel">Request to Join <?php echo $team['team_name']; ?></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]) . '?id=' . $team_id; ?>" method="post">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="message" class="form-label">Message to Team Leader</label>
+                        <textarea class="form-control" id="message" name="message" rows="4" placeholder="Introduce yourself and explain why you want to join this team..."></textarea>
+                    </div>
+                    <input type="hidden" name="action" value="join">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Send Request</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<?php
+// Include footer
+require_once '../includes/footer.php';
+?>
+
+<!-- Fix for member display issues -->
+<style>
+/* Ensure all table rows in the members summary are displayed */
+#member-summary-table tr {
+    display: table-row !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+/* Fix table cell display */
+#member-summary-table td, #member-summary-table th {
+    display: table-cell !important;
+    visibility: visible !important;
+}
+
+/* Fix badge display */
+#member-summary-table .badge {
+    display: inline-block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+/* Ensure table is visible */
+#member-summary-table {
+    display: table !important;
+    width: 100% !important;
+    visibility: visible !important;
+    border-collapse: collapse !important;
+}
+
+/* Fixed table header */
+#member-summary-table thead {
+    background-color: #f8f9fa;
+    font-weight: bold;
+}
+
+/* Highlight effect for rows */
+.highlight-row {
+    animation: highlight 2s ease-in-out;
+}
+
+@keyframes highlight {
+    0% { background-color: #fff; }
+    50% { background-color: #fffde7; }
+    100% { background-color: #fff; }
+}
+
+/* Fix for Safari/IE flexbox issues that might be affecting the display */
+.card-body {
+    display: block !important; /* Force block display instead of flex */
+}
+
+/* Additional fix for any elements with display:flex that might be causing issues */
+.d-flex {
+    display: flex !important;
+    min-height: auto !important;
+    flex-wrap: wrap !important;
+}
+
+/* Ensure badges are visible in Safari and older browsers */
+.badge {
+    display: inline-block !important;
+    min-width: 50px !important;
+    z-index: 1 !important;
+    position: relative !important;
+}
+
+/* Global fix for any hidden elements */
+.invisible, [hidden], [style*="display: none"], [style*="visibility: hidden"] {
+    display: initial !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+</style>
+
+<script>
+// Debug function to check if all team members are displayed properly
+document.addEventListener('DOMContentLoaded', function() {
+    console.clear();
+    console.log("Team details page loaded");
+    
+    // Only run for admin or team leader
+    const debugElement = document.querySelector(".alert-info.mb-3 small");
+    if (debugElement) {
+        // Log team data for verification
+        console.log("Team members data check:");
+        
+        // Check the table rows
+        const memberTable = document.getElementById('member-summary-table');
+        const memberRows = memberTable ? memberTable.querySelectorAll("tbody tr") : [];
+        console.log(`Found ${memberRows.length} team member rows in table`);
+        
+        // Check for empty state row
+        const emptyRow = memberTable ? memberTable.querySelector("tbody tr td[colspan='2']") : null;
+        if (emptyRow) {
+            console.log("Empty state row found:", emptyRow.innerText);
+        }
+        
+        // Check each member
+        memberRows.forEach((row, index) => {
+            if (!row.querySelector("td[colspan='2']")) {
+                const userId = row.getAttribute('data-user-id');
+                const name = row.cells[0].innerText.trim();
+                const role = row.cells[1].innerText.trim();
+                console.log(`Member ${index + 1}: ID=${userId}, Name=${name}, Role=${role}`);
+            }
+        });
+        
+        // Update the debug display with visible count
+        if (debugElement) {
+            const actualMemberCount = emptyRow ? 0 : memberRows.length;
+            debugElement.textContent += ` | ${actualMemberCount} member(s) visible in table`;
+        }
+    }
+    
+    // Add validation checks to ensure rows are visible
+    setTimeout(function() {
+        const table = document.getElementById('member-summary-table');
+        if (table) {
+            // Ensure table is visible
+            table.style.display = 'table';
+            
+            // Check if any rows are hidden
+            const rows = table.querySelectorAll("tbody tr");
+            rows.forEach((row) => {
+                // Skip empty state row
+                if (row.querySelector("td[colspan='2']")) return;
+                
+                // Check if row is visible
+                const computedStyle = window.getComputedStyle(row);
+                if (computedStyle.display === 'none' || computedStyle.visibility === 'hidden' || computedStyle.opacity === '0') {
+                    console.warn("Hidden row detected, fixing:", row);
+                    row.style.display = 'table-row';
+                    row.style.visibility = 'visible';
+                    row.style.opacity = '1';
+                }
+                
+                // Add highlight effect
+                row.classList.add('highlight-row');
+            });
+            
+            console.log("Visibility check complete");
+        }
+    }, 500);
+});
+
+// Force refresh if needed
+<?php if (isset($_GET['refresh'])): ?>
+console.log("Manual refresh triggered");
+<?php endif; ?>
+</script>
+
+<?php if (isset($_GET['updated']) && $_GET['updated'] == 'true'): ?>
+<script>
+// If the page was just updated, refresh it once to ensure the latest data is shown
+document.addEventListener('DOMContentLoaded', function() {
+    // Check if we've already refreshed
+    const hasRefreshed = sessionStorage.getItem('hasRefreshed');
+    if (!hasRefreshed) {
+        console.log("Auto-refreshing page to ensure latest data...");
+        sessionStorage.setItem('hasRefreshed', 'true');
+        // Delay the refresh slightly to ensure any DB operations are complete
+        setTimeout(function() {
+            window.location.href = "<?php echo BASE_URL; ?>/pages/team-details.php?id=<?php echo $team_id; ?>&refreshed=true";
+        }, 1000);
+    } else {
+        // Clear the flag for next time
+        sessionStorage.removeItem('hasRefreshed');
+        console.log("Page has been refreshed, displaying latest data");
+    }
+});
+</script>
+<?php endif; ?>
+
+<!-- Emergency refresh if no team members are found -->
+<script>
+// Check if we need to force a reload due to no members being visible
+document.addEventListener('DOMContentLoaded', function() {
+    // Don't run if we're already in a refresh cycle
+    if (window.location.href.indexOf('refreshed=true') !== -1 || 
+        window.location.href.indexOf('emergency_reload=true') !== -1) {
+        return;
+    }
+    
+    // Wait for DOM to fully render
+    setTimeout(function() {
+        const memberTable = document.getElementById('member-summary-table');
+        if (memberTable) {
+            const rows = memberTable.querySelectorAll('tbody tr.member-row');
+            const emptyRow = memberTable.querySelector("tbody tr td[colspan='2']");
+            const memberCountDisplay = document.getElementById('total-members-count');
+            
+            // Update the member count display with actual visible members
+            if (memberCountDisplay) {
+                memberCountDisplay.textContent = rows.length;
+                console.log(`Updated member count to ${rows.length}`);
+            }
+            
+            // If we have an empty message but we know there should be members (from debug data)
+            if (emptyRow && <?php echo count($team_members); ?> > 0) {
+                console.warn("Emergency situation: Team members exist in database but aren't displaying. Forcing page reload.");
+                // Set flag to prevent infinite reload
+                sessionStorage.setItem('emergency_reloaded', 'true');
+                // Reload the page
+                window.location.href = "<?php echo BASE_URL; ?>/pages/team-details.php?id=<?php echo $team_id; ?>&emergency_reload=true";
+            } else if (rows.length === 0 && <?php echo !empty($direct_members_check) ? count($direct_members_check) : 0; ?> > 0) {
+                console.warn("No team member rows found but database has members. Forcing reload.");
+                sessionStorage.setItem('emergency_reloaded', 'true');
+                window.location.href = "<?php echo BASE_URL; ?>/pages/team-details.php?id=<?php echo $team_id; ?>&emergency_reload=true";
+            }
+            
+            // Add highlighting to all member rows
+            rows.forEach(row => {
+                row.classList.add('highlight-row');
+            });
+        }
+    }, 1000); // Wait 1 second after DOM load to check
+});
+</script>
+
+<!-- JavaScript to ensure team members are visible -->
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    console.log("Checking team members visibility...");
+    
+    // Get the count from PHP and the actual visible rows
+    const phpMemberCount = <?php echo count($team_members); ?>;
+    const directSqlCount = <?php echo count($direct_members); ?>;
+    const visibleRows = document.querySelectorAll('.member-row');
+    
+    console.log(`PHP reports ${phpMemberCount} members`);
+    console.log(`Direct SQL found ${directSqlCount} members`);
+    console.log(`Found ${visibleRows.length} visible member rows in table`);
+    
+    // Highlight each member row to ensure visibility
+    visibleRows.forEach((row, index) => {
+        setTimeout(() => {
+            row.style.backgroundColor = '#f8f9fa';
+            setTimeout(() => {
+                row.style.backgroundColor = '';
+            }, 300);
+        }, index * 200);
+    });
+    
+    // If we detect an issue with member count, but have direct data, reload once
+    const hasReloaded = sessionStorage.getItem('teamPageReloaded');
+    if (!hasReloaded && directSqlCount > 0 && (phpMemberCount === 0 || visibleRows.length === 0)) {
+        console.log("EMERGENCY: Members not displaying correctly. Attempting one-time reload...");
+        sessionStorage.setItem('teamPageReloaded', 'true');
+        setTimeout(() => {
+            window.location.reload();
+        }, 1000);
+    } else if (hasReloaded) {
+        console.log("Page has already been reloaded once. Using emergency display methods.");
+        sessionStorage.removeItem('teamPageReloaded');
+    }
+});
+</script>
+
+<?php
+// Include footer
+include_once '../includes/footer.php';
+?> 

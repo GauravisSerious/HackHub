@@ -1,0 +1,1 @@
+<?php\n// No BOM test\necho " Test starting...\;

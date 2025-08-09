@@ -1,0 +1,24 @@
+# Prevent direct access to PHP files in this directory
+Order Deny,Allow
+Deny from all
+
+# But allow access to specific files that need direct access
+<Files "logout.php">
+    Allow from all
+</Files>
+
+<Files "process_request.php">
+    Allow from all
+</Files>
+
+<Files "remove_member.php">
+    Allow from all
+</Files>
+
+<Files "mark_notification_read.php">
+    Allow from all
+</Files>
+
+<Files "process_project.php">
+    Allow from all
+</Files> 

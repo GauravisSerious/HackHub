@@ -55,57 +55,6 @@ A comprehensive web application for organizing and managing hackathon events. Th
 
    - Ensure the `uploads` directory has write permissions:
 
-   ```bash
-   chmod 755 uploads
-   ```
-
-5. **Web Server Setup**
-
-   - Configure your web server (Apache/Nginx) to point to the project directory
-   - If using Apache, the `.htaccess` file is already included
-
-## Usage
-
-1. **Admin Access**
-
-   - Default admin credentials:
-     - Email: admin@example.com
-     - Password: admin123
-   - After logging in, access the admin panel to configure hackathon settings
-
-2. **Participant Registration**
-
-   - Users can register as participants
-   - Admin approval is required before participants can access the system
-
-3. **Team Formation**
-
-   - Approved participants can create or join teams
-   - Team leaders can approve/reject join requests
-
-4. **Project Submission**
-
-   - Teams can submit project details, including:
-     - Title and description
-     - Technologies used
-     - GitHub repository links
-     - Demo links
-     - Supporting files
-
-5. **Project Evaluation**
-
-   - Admins can evaluate projects on criteria such as:
-     - Innovation
-     - Functionality
-     - Code quality
-     - Presentation
-
-6. **Leaderboard**
-
-   - View the rankings of all evaluated projects
-   - Top projects are highlighted
-
-## Directory Structure
 
 ```
 hackathon-management-system/
@@ -126,17 +75,35 @@ hackathon-management-system/
 └── hackathon.sql           # Database schema
 ```
 
-## Security Considerations
+---
 
-- All user inputs are validated and sanitized
-- Passwords are securely hashed using PHP's password_hash()
-- SQL injection protection through prepared statements
-- CSRF protection for form submissions
+## 🔒 Security
 
-## License
+- 🔒 Secure password hashing with `password_hash()`
+- 🛡️ SQL injection prevention using prepared statements
+- 🛡️ CSRF protection for all forms
+- 🔍 Input validation and sanitization
+- 🔄 Session security measures
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+---
 
-## Contributors
+## 🤝 Contributing
 
-- Your Name - Initial work 
+We love contributions! Here's how you can help:
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+---
+
+
+
+---
+
+<div align="center">
+  <h3>Show some ❤️ by starring this repository!</h3>
+  <p>Created with ☕ and ❤️ by Team Cloud</p>
+</div>
